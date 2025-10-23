@@ -9,16 +9,23 @@ import termios
 import signal
 import struct
 import fcntl
+import re
+import logging
+import argparse
+
+log = logging.getLogger(__name__)
 
 
 class SessionRecorder:
     def __init__(self, output_file="recorded_session.txt", silence_threshold=0.5):
         self.output_file = output_file
         self.silence_threshold = silence_threshold
-        self.last_output_time = time.time()
-        self.output_active = False
-        self.recorded_commands = []
         self.child_pid = None
+        self.prompt_map = {
+            '$ ': 'sh',
+            'mysql> ': 'mysql',
+            '>>> ': 'python',
+        }
 
     def record_session(self):
         """Record an interactive session and generate command file"""
@@ -49,6 +56,7 @@ class SessionRecorder:
             # Start shell with proper terminal setup
             os.environ['TERM'] = 'xterm'
             os.environ['PS1'] = '$ '
+
             os.execlp('bash', 'bash', '--norc', '-i')
         else:
             # Parent process - store child PID for signal forwarding
@@ -66,14 +74,21 @@ class SessionRecorder:
 
             os.close(slave)
 
-            current_command = ""
+            # Local variables for recording session
+            recorded_commands = []  # Commands to be written to output file
+            last_output_time = time.time()  # Last time shell emitted output
+            current_prompt = ""  # Current shell prompt (everything since last newline)
+            last_recorded_prompt = ""  # Last prompt sent to recording
+            command_so_far = ""  # Current command being typed by user
+            recording = True  # True until we should stop recording
 
             try:
-                while True:
-                    r, w, e = select.select([master, sys.stdin], [], [], 10.0)
+                while recording:
+                    log.debug("Calling select")
+                    r, w, e = select.select([master, sys.stdin], [], [], min(self.silence_threshold, 10))
 
                     # Check for output silence
-                    time_since_output = time.time() - self.last_output_time
+                    time_since_output = time.time() - last_output_time
                     output_is_silent = time_since_output >= self.silence_threshold
 
                     child_exited = False
@@ -82,69 +97,103 @@ class SessionRecorder:
                         if fd == master:
                             # Output from child process
                             try:
+                                log.debug("Reading from master")
                                 data = os.read(master, 1024)
                                 if not data:
+                                    log.debug("EOF from master - child exited")
                                     child_exited = True
                                     break
 
                                 # Write to stdout so user can see
+                                log.debug("Writing to stdout")
                                 os.write(1, data)
 
                                 # Update output tracking
-                                self.last_output_time = time.time()
-                                self.output_active = True
+                                last_output_time = time.time()
+
+                                # Process output for prompt detection
+                                decoded_data = data.decode('utf-8', errors='ignore')
+
+                                # Update current prompt: everything since last newline
+                                if '\n' in decoded_data:
+                                    # Newline found - reset prompt to content after last newline
+                                    lines = decoded_data.split('\n')
+                                    current_prompt = lines[-1]  # Content after last newline
+                                else:
+                                    # No newline - append to current prompt
+                                    current_prompt += decoded_data
+                                log.debug("Current prompt updated to: %r", current_prompt)
 
                             except (OSError, IOError):
+                                log.debug("Error reading from master - child likely exited")
                                 child_exited = True
                                 break
 
                         elif fd == sys.stdin:
                             # Input from user - character-oriented non-blocking read
+                            # print('@@ Reading from stdin (character-oriented)')
                             try:
                                 user_char_just_read = sys.stdin.read(1)
+                                log.debug("User input: %r", user_char_just_read)
 
                                 # Handle EOF (empty string from read)
                                 if not user_char_just_read:
+                                    log.debug("EOF on stdin - stopping recording")
+                                    recording = False
                                     break
 
                                 # Check for Ctrl+T (ASCII 20) to stop recording
                                 if user_char_just_read == '\x14':  # Ctrl+T
+                                    log.debug("Ctrl+T detected - stopping recording")
+                                    recording = False
                                     break
 
                                 # Send to child process (unless it's Ctrl+T)
                                 if user_char_just_read != '\x14':
+                                    log.debug("Writing user_char_just_read=%r to master", user_char_just_read)
                                     os.write(master, user_char_just_read.encode())
 
                                 # Check if we're at a prompt - start command when we get user input
+                                log.debug(
+                                    "Command state: output_is_silent=%s, current_command=%r",
+                                    output_is_silent,
+                                    command_so_far,
+                                )
 
-                                # Start a new command if we're not already in one
-                                if not current_command:
-                                    current_command = user_char_just_read
-                                else:
-                                    # Continuation of existing command
-                                    current_command += user_char_just_read
+                                # Check if user is typing after silence period
+                                clean_prompt = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', current_prompt)
+                                if output_is_silent and clean_prompt and clean_prompt != last_recorded_prompt:
+                                    log.debug("Recording prompt: %r", clean_prompt)
+                                    # Record prompt before first user input after silence
+                                    # Map common prompts to shorter forms
+                                    prompt_command = self.prompt_map.get(clean_prompt, f"prompt {clean_prompt}")
+                                    recorded_commands.append(f"#> {prompt_command}")
+                                    last_recorded_prompt = clean_prompt
 
                                 # Check for command completion (Enter key)
                                 if user_char_just_read in ['\r', '\n']:
-                                    if current_command.strip():
-                                        # Save the completed command
-                                        command = current_command.rstrip('\r\n')
-                                        if command:
-                                            self.recorded_commands.append(command)
+                                    log.debug("Command completion detected. Command: %r", command_so_far)
+                                    # Save the completed command
+                                    if command_so_far:
+                                        log.debug("Recording command")
+                                        recorded_commands.append(command_so_far)
+                                        log.debug("RECORDED: %r", command_so_far)
+                                        command_so_far = ""
+                                    continue
 
-                                        current_command = ""
+                                # Ok, just a normal key
+                                command_so_far += user_char_just_read
+                                log.debug("Command is now: %r", command_so_far)
+
                             except IOError:
                                 # Expected when no data available in non-blocking mode
+                                log.debug("No data available (non-blocking)")
                                 pass
 
                     # Check if we need to break out of main loop
                     if child_exited:
-                        break
+                        recording = False
 
-                    # Check for exit conditions from stdin
-                    if not r and output_is_silent and self.output_active:
-                        # No activity and output is silent - might be at prompt
-                        self.output_active = False
             except Exception as e:
                 print(f"\nUnexpected error: {e}")
             finally:
@@ -153,6 +202,7 @@ class SessionRecorder:
                 # Restore parent's stdin settings
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_stdin_settings)
                 # Write final commands and cleanup
+                self.recorded_commands = recorded_commands
                 self.finalize_recording()
                 os.close(master)
                 try:
@@ -167,7 +217,8 @@ class SessionRecorder:
             print(f"\nRecorded {len(self.recorded_commands)} commands to {self.output_file}")
             with open(self.output_file, 'w') as f:
                 f.write("# Automatically recorded session\n")
-                f.write("# Commands will be replayed with timing based on user input\n")
+                f.write("# Commands will be replayed according to prompts\n")
+                f.write("# See https://github.com/CapnKernel/termit for details\n")
                 for command in self.recorded_commands:
                     f.write(f"{command}\n")
         else:
@@ -175,10 +226,31 @@ class SessionRecorder:
 
 
 def main():
-    output_file = sys.argv[1] if len(sys.argv) > 1 else "recorded_session.txt"
-    silence_threshold = float(sys.argv[2]) if len(sys.argv) > 2 else 10
+    parser = argparse.ArgumentParser(description='Record terminal session commands')
+    parser.add_argument(
+        'output_file',
+        nargs='?',
+        default='recorded_session.txt',
+        help='Output file for recorded commands (default: recorded_session.txt)',
+    )
+    parser.add_argument(
+        'silence_threshold',
+        nargs='?',
+        type=float,
+        default=2.0,
+        help='Silence threshold in seconds for prompt detection (default: 2.0)',
+    )
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
 
-    recorder = SessionRecorder(output_file, silence_threshold)
+    args = parser.parse_args()
+
+    # Configure logging based on debug flag
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
+    else:
+        logging.basicConfig(level=logging.WARNING, format='%(message)s')
+
+    recorder = SessionRecorder(args.output_file, args.silence_threshold)
     recorder.record_session()
 
 
