@@ -123,9 +123,12 @@ class PTYRunner:
         master, slave = pty.openpty()
         log.debug("Created PTY: master=%d, slave=%d", master, slave)
 
-        # Set the slave PTY to raw mode
+        # Get the current slave PTY settings and ensure ECHO is enabled
         old_settings = termios.tcgetattr(slave)
-        tty.setraw(slave)
+        new_settings = termios.tcgetattr(slave)
+        # Enable ECHO in the local mode flags
+        new_settings[3] |= termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, new_settings)
 
         pid = os.fork()
         log.debug("Forked process: pid=%d", pid)
@@ -139,6 +142,10 @@ class PTYRunner:
             os.dup2(slave, 1)
             os.dup2(slave, 2)
             os.close(slave)
+
+            # Set terminal environment variables for proper shell behavior
+            os.environ['TERM'] = 'xterm'
+            os.environ['PS1'] = '$ '
 
             # Start interactive shell
             os.execlp('bash', 'bash', '--norc', '-i')
@@ -162,7 +169,6 @@ class PTYRunner:
                         self._process_meta_command(master, line[2:].strip())
                     else:
                         # This is a regular command to execute
-                        print(f"\033[1;32m$\033[0m {line}", end="")  # Show command in green without newline
                         self.send_command(master, line)
                         if not self.wait_for_prompt(master):
                             print("Command failed to complete")
