@@ -93,7 +93,7 @@ class PTYRunner:
     def send_command(self, master, command):
         """Send a command to the PTY"""
         log.debug("Sending command: %r", command)
-        os.write(master, f"{command}\r\n".encode())
+        os.write(master, f"{command}\r".encode())
 
     def send_eof(self, master):
         """Send Ctrl+D (EOF)"""
