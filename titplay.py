@@ -15,13 +15,13 @@ log = logging.getLogger(__name__)
 
 class PTYRunner:
     def __init__(self, silence_threshold=0.5):
-        self.current_prompt = r'\$ '  # Default shell prompt
         self.prompt_patterns = {
             'sh': [r'\$ ', r'# ', r'> '],
             'mysql': [r'mysql> ', r'-> ', r'"\'> '],
             'psql': [r'[#=>] ', r'-\? '],
             'python': [r'>>> ', r'\.\.\. '],
         }
+        self.current_prompt = self.prompt_patterns['sh'] # Default to shell prompt
         self.silence_threshold = silence_threshold
 
     def wait_for_prompt(self, master, timeout=30):
@@ -145,7 +145,7 @@ class PTYRunner:
 
             # Set terminal environment variables for proper shell behavior
             os.environ['TERM'] = 'xterm'
-            os.environ['PS1'] = '$ '
+            # os.environ['PS1'] = '$ '
 
             # Start interactive shell
             os.execlp('bash', 'bash', '--norc', '-i')
